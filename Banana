@@ -1,0 +1,399 @@
+import os
+import datetime
+import threading
+import time
+import smtplib
+import schedule
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from flask import Flask, request, render_template, jsonify, redirect, url_for
+import stripe
+
+app = Flask(__name__, template_folder='.')
+
+# =====================================================================
+# CONFIGURAÇÕES — preenche com os teus dados reais
+# =====================================================================
+stripe.api_key        = os.environ.get("STRIPE_SECRET_KEY", "sk_test_SUA_CHAVE_AQUI")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "whsec_SUA_CHAVE_AQUI")
+EMAIL_REMETENTE       = os.environ.get("EMAIL_USER", "seuemail@gmail.com")
+EMAIL_SENHA           = os.environ.get("EMAIL_PASS", "sua_senha_de_app")
+
+# IDs dos produtos no Stripe (crias no dashboard stripe.com)
+PRICE_USUARIO = os.environ.get("STRIPE_PRICE_USUARIO", "price_USUARIO_ID")
+PRICE_BG      = os.environ.get("STRIPE_PRICE_BG",      "price_BG_ID")
+
+# =====================================================================
+# BANCO DE DADOS
+# =====================================================================
+BANCO_DE_VIRUS = {
+    "44d88612fea8a8f36de82e1278abb02f": "Trojan.Win32.Generic (Ladrão de Senhas)",
+    "5d41402abc4b2a76b9719d911017c592": "Ransomware.WannaCry (Bloqueador de Arquivos)",
+    "8ee30b0b8c54c3e8093123b32080a82b": "Spyware.Pegasus.Mock (Espião de Microfone/Câmera)",
+    "098f6bcd4621d373cade4e832627b4f6": "Adware.PopUp.Helper (Injetor de Anúncios)",
+    "21232f297a57a5a743894a0e4a801fc3": "Worm.NetSky (Infecciona Pendrives)",
+    "b14a7b8059d9c055954c92674ce60032": "Keylogger.AgentTesla (Captura de Teclado)",
+    "eccbc87e4b5ce2fe28308fd9f2a7baf3": "Backdoor.Poison.Ivy (Acesso Remoto)",
+}
+
+DATABASE_ASSINANTES = {
+    "usuario1@email.com": {
+        "nome": "João Silva",
+        "plano": "Usuario",
+        "validade": datetime.date(2026, 12, 31),
+        "pastas_limpas": ["C:\\Downloads", "C:\\Users\\User\\Desktop"],
+        "virus_removidos": 2,
+        "ultimo_scan": "2026-05-10"
+    },
+    "empresa_bg@email.com": {
+        "nome": "Empresa B and G",
+        "plano": "B and G",
+        "validade": datetime.date(2026, 12, 31),
+        "pastas_limpas": ["/server/bin", "/backup/dados", "/var/www"],
+        "virus_removidos": 14,
+        "ultimo_scan": "2026-05-15"
+    },
+    "inadimplente@email.com": {
+        "nome": "Carlos Inadimplente",
+        "plano": "Usuario",
+        "validade": datetime.date(2026, 4, 1),
+        "pastas_limpas": [],
+        "virus_removidos": 0,
+        "ultimo_scan": "N/A"
+    }
+}
+
+# =====================================================================
+# HELPERS
+# =====================================================================
+
+def total_ativos():
+    hoje = datetime.date.today()
+    return sum(1 for c in DATABASE_ASSINANTES.values() if c["validade"] >= hoje)
+
+def total_removidos():
+    return sum(c["virus_removidos"] for c in DATABASE_ASSINANTES.values())
+
+def tela(titulo, mensagem, cor):
+    return f"""
+    <!DOCTYPE html><html lang="pt-BR">
+    <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Bedrock IA</title>
+    <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Rajdhani:wght@700&family=Inter:wght@400;500&display=swap" rel="stylesheet">
+    <style>
+        *{{box-sizing:border-box;margin:0;padding:0}}
+        body{{background:#0a0c10;color:#c8d0e0;font-family:'Inter',sans-serif;min-height:100vh;
+              display:flex;align-items:center;justify-content:center;padding:40px 20px}}
+        body::before{{content:'';position:fixed;inset:0;
+              background-image:linear-gradient(rgba(0,255,136,.03) 1px,transparent 1px),
+              linear-gradient(90deg,rgba(0,255,136,.03) 1px,transparent 1px);
+              background-size:40px 40px;pointer-events:none}}
+        .box{{position:relative;background:#111318;border:1px solid #1e2430;border-radius:12px;
+              padding:36px;max-width:520px;width:100%;box-shadow:0 16px 48px rgba(0,0,0,.6)}}
+        h2{{font-family:'Rajdhani',sans-serif;font-size:22px;color:{cor};margin-bottom:16px;text-align:center}}
+        p{{line-height:1.7;color:#aab0c0;font-size:14px}}
+        a{{display:inline-block;margin-top:24px;color:#00ff88;font-family:'Share Tech Mono',monospace;
+           font-size:13px;text-decoration:none;border:1px solid rgba(0,255,136,.3);
+           padding:10px 20px;border-radius:6px;width:100%;text-align:center;transition:background .2s}}
+        a:hover{{background:rgba(0,255,136,.08)}}
+    </style></head>
+    <body><div class="box"><h2>{titulo}</h2><p>{mensagem}</p><a href="/">← Voltar ao Painel</a></div></body>
+    </html>"""
+
+# =====================================================================
+# ROTAS PRINCIPAIS
+# =====================================================================
+
+@app.route('/')
+def home():
+    return render_template('index.html',
+        banco_virus=BANCO_DE_VIRUS,
+        total_ativos=total_ativos(),
+        total_removidos=total_removidos()
+    )
+
+
+# ── SCAN EM TEMPO REAL (Server-Sent Events) ──
+@app.route('/scan-stream', methods=['GET'])
+def scan_stream():
+    """Envia progresso do scan passo a passo via SSE."""
+    email = request.args.get('email', '').strip().lower()
+    hoje = datetime.date.today()
+
+    def gerar_eventos():
+        if email not in DATABASE_ASSINANTES:
+            yield "data: ERRO:E-mail não encontrado no sistema.\n\n"
+            return
+
+        cliente = DATABASE_ASSINANTES[email]
+
+        if hoje > cliente["validade"]:
+            yield "data: ERRO:Assinatura expirada. Renove para continuar protegido.\n\n"
+            return
+
+        pastas = cliente["pastas_limpas"] or ["C:\\System32", "C:\\Windows\\Temp"]
+
+        yield f"data: LOG:🔐 Autenticando {cliente['nome']}...\n\n"
+        time.sleep(0.8)
+
+        yield f"data: LOG:✅ Plano {cliente['plano']} confirmado.\n\n"
+        time.sleep(0.6)
+
+        yield f"data: LOG:📂 Carregando {len(BANCO_DE_VIRUS)} assinaturas de vírus...\n\n"
+        time.sleep(0.8)
+
+        total_ficheiros = 0
+        for i, pasta in enumerate(pastas):
+            yield f"data: LOG:🔍 Escaneando: {pasta}\n\n"
+            time.sleep(0.7)
+
+            # Simula ficheiros encontrados
+            ficheiros = (i + 1) * 47 + len(pasta)
+            total_ficheiros += ficheiros
+            yield f"data: PROGRESS:{int(((i+1)/len(pastas))*80)}\n\n"
+            time.sleep(0.5)
+
+        yield f"data: LOG:🧬 Verificando processos em memória RAM...\n\n"
+        time.sleep(0.9)
+        yield f"data: PROGRESS:90\n\n"
+
+        yield f"data: LOG:🛡 Validando integridade do sistema...\n\n"
+        time.sleep(0.7)
+
+        removidos = cliente["virus_removidos"]
+        yield f"data: LOG:🚫 Ameaças eliminadas: {removidos} arquivo(s) malicioso(s)\n\n"
+        time.sleep(0.5)
+
+        if cliente["plano"] == "B and G":
+            yield "data: LOG:🔥 [B and G] Firewall de rede reforçado.\n\n"
+            time.sleep(0.4)
+            yield "data: LOG:📡 [B and G] IPs suspeitos bloqueados.\n\n"
+            time.sleep(0.4)
+
+        yield f"data: PROGRESS:100\n\n"
+        time.sleep(0.3)
+        yield f"data: DONE:{total_ficheiros} ficheiros analisados. {removidos} ameaças removidas.\n\n"
+
+        # Atualiza último scan
+        DATABASE_ASSINANTES[email]["ultimo_scan"] = hoje.strftime("%Y-%m-%d")
+
+    return app.response_class(gerar_eventos(), mimetype='text/event-stream',
+                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.route('/analisar-phishing', methods=['POST'])
+def analisar_phishing():
+    texto = request.form.get('texto_email', '').lower()
+    gatilhos = [
+        "urgente", "clique aqui", "sua conta foi bloqueada",
+        "atualize seus dados", "ganhou", "herança",
+        "vencerá hoje", "sua senha expirou", "transferência imediata",
+        "confirme seus dados", "acesso suspenso", "prêmio", "grátis por tempo limitado"
+    ]
+    encontrados = [g for g in gatilhos if g in texto]
+    pontos = len(encontrados)
+
+    if pontos >= 2:
+        return tela("🚨 Phishing Detectado!",
+            f"Padrão de engenharia social identificado.<br>"
+            f"<strong>Gatilhos:</strong> {', '.join(encontrados)}.<br><br>"
+            "❌ Não clique em links. Delete esta mensagem.", "#ff3355")
+    elif pontos == 1:
+        return tela("⚠️ Mensagem Suspeita",
+            f"Gatilho encontrado: <strong>{encontrados[0]}</strong>.<br>"
+            "Verifique o remetente com cuidado.", "#ffcc00")
+    else:
+        return tela("✅ E-mail Seguro",
+            "Nenhum padrão de phishing detectado pelo Bedrock IA.", "#00ff88")
+
+
+@app.route('/verificar-hash', methods=['POST'])
+def verificar_hash():
+    hash_md5 = request.form.get('hash_md5', '').strip().lower()
+    if len(hash_md5) != 32:
+        return tela("⚠️ Hash Inválido", "MD5 deve ter exatamente 32 caracteres.", "#ffcc00")
+    if hash_md5 in BANCO_DE_VIRUS:
+        return tela("🚨 Arquivo Malicioso!",
+            f"<strong>Ameaça:</strong> {BANCO_DE_VIRUS[hash_md5]}<br><br>"
+            "⛔ Não execute nem compartilhe este arquivo.", "#ff3355")
+    return tela("✅ Hash Limpo",
+        "Hash não encontrado no banco de ameaças. Arquivo aparentemente seguro.", "#00ff88")
+
+
+@app.route('/gerar-relatorio', methods=['POST'])
+def gerar_relatorio():
+    email = request.form.get('email_relatorio', '').strip().lower()
+    hoje = datetime.date.today()
+    if email not in DATABASE_ASSINANTES:
+        return tela("❌ Não Encontrado", "E-mail não localizado.", "#ff3355")
+    c = DATABASE_ASSINANTES[email]
+    status = "✅ ATIVA" if hoje <= c["validade"] else "❌ EXPIRADA"
+    dias = (c["validade"] - hoje).days
+    rel = (f"<strong>Relatório:</strong> {hoje.strftime('%d/%m/%Y')}<br><br>"
+           f"👤 {c['nome']} — {email}<br>💎 Plano: {c['plano']}<br>"
+           f"📅 Validade: {c['validade'].strftime('%d/%m/%Y')} — {status}<br>")
+    if hoje <= c["validade"]:
+        rel += f"⏳ {dias} dias restantes<br>"
+    rel += (f"<br>🕐 Último scan: {c['ultimo_scan']}<br>"
+            f"🚫 Vírus removidos: {c['virus_removidos']}<br>")
+    for p in c["pastas_limpas"]:
+        rel += f"&nbsp;&nbsp;→ {p}<br>"
+    cor = "#00ff88" if hoje <= c["validade"] else "#ff3355"
+    return tela("📋 Relatório de Segurança", rel, cor)
+
+
+# =====================================================================
+# STRIPE — SISTEMA DE PAGAMENTO
+# =====================================================================
+
+@app.route('/checkout/<plano>')
+def checkout(plano):
+    """Cria sessão de pagamento no Stripe e redireciona."""
+    precos = {"usuario": PRICE_USUARIO, "bg": PRICE_BG}
+    if plano not in precos:
+        return tela("❌ Plano Inválido", "Escolhe um plano válido.", "#ff3355")
+
+    try:
+        session = stripe.checkout.Session.create(
+            payment_method_types=["card"],
+            line_items=[{"price": precos[plano], "quantity": 1}],
+            mode="subscription",
+            success_url=request.host_url + "pagamento-sucesso?session_id={CHECKOUT_SESSION_ID}",
+            cancel_url=request.host_url + "pagamento-cancelado",
+        )
+        return redirect(session.url, code=303)
+    except Exception as e:
+        return tela("❌ Erro no Pagamento", f"Não foi possível iniciar o checkout: {str(e)}", "#ff3355")
+
+
+@app.route('/pagamento-sucesso')
+def pagamento_sucesso():
+    return tela("✅ Pagamento Confirmado!",
+        "A tua assinatura Bedrock IA está ativa.<br>"
+        "Vais receber um e-mail de confirmação em breve.<br><br>"
+        "🛡 Bem-vindo à proteção total!", "#00ff88")
+
+
+@app.route('/pagamento-cancelado')
+def pagamento_cancelado():
+    return tela("⚠️ Pagamento Cancelado",
+        "O pagamento foi cancelado. Podes tentar novamente quando quiseres.", "#ffcc00")
+
+
+@app.route('/webhook-stripe', methods=['POST'])
+def webhook_stripe():
+    """Recebe confirmações do Stripe e ativa assinantes automaticamente."""
+    payload = request.get_data(as_text=True)
+    sig = request.headers.get('Stripe-Signature', '')
+
+    try:
+        event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
+    except Exception:
+        return jsonify({"error": "Webhook inválido"}), 400
+
+    if event["type"] == "checkout.session.completed":
+        session = event["data"]["object"]
+        email_cliente = session.get("customer_email", "")
+        plano_id = session.get("metadata", {}).get("plano", "Usuario")
+
+        # Activa ou cria assinante automaticamente
+        DATABASE_ASSINANTES[email_cliente] = {
+            "nome": email_cliente.split("@")[0].title(),
+            "plano": plano_id,
+            "validade": datetime.date.today() + datetime.timedelta(days=30),
+            "pastas_limpas": ["C:\\Downloads", "C:\\Users\\Desktop"],
+            "virus_removidos": 0,
+            "ultimo_scan": "N/A"
+        }
+        enviar_email_boas_vindas(email_cliente, plano_id)
+
+    return jsonify({"status": "ok"}), 200
+
+
+# =====================================================================
+# EMAIL SEMANAL — AVISOS DE VÍRUS
+# =====================================================================
+
+def enviar_email(destinatario, assunto, corpo_html):
+    """Envia e-mail via Gmail SMTP."""
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = assunto
+        msg["From"]    = EMAIL_REMETENTE
+        msg["To"]      = destinatario
+        msg.attach(MIMEText(corpo_html, "html"))
+
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+            smtp.login(EMAIL_REMETENTE, EMAIL_SENHA)
+            smtp.sendmail(EMAIL_REMETENTE, destinatario, msg.as_string())
+        print(f"[EMAIL] Enviado para {destinatario}")
+    except Exception as e:
+        print(f"[EMAIL] Erro ao enviar para {destinatario}: {e}")
+
+
+def enviar_email_boas_vindas(email, plano):
+    corpo = f"""
+    <div style="background:#0a0c10;padding:40px;font-family:Arial,sans-serif;color:#c8d0e0">
+        <h2 style="color:#00ff88">🛡 Bem-vindo ao Bedrock IA!</h2>
+        <p>A tua assinatura do plano <strong style="color:#00ff88">{plano}</strong> está ativa.</p>
+        <p>Os teus dispositivos estão agora protegidos.</p>
+        <br>
+        <p style="color:#888;font-size:12px">Bedrock IA © 2026</p>
+    </div>"""
+    enviar_email(email, "🛡 Bedrock IA — Assinatura Ativa!", corpo)
+
+
+def enviar_alerta_semanal():
+    """Envia email semanal com os vírus mais recentes para todos os assinantes ativos."""
+    hoje = datetime.date.today()
+    virus_lista = "".join(
+        f"<li style='margin-bottom:8px'><span style='color:#ff3355'>⬡ {nome}</span>"
+        f"<br><code style='color:#555;font-size:11px'>MD5: {h}</code></li>"
+        for h, nome in BANCO_DE_VIRUS.items()
+    )
+
+    corpo = f"""
+    <div style="background:#0a0c10;padding:40px;font-family:Arial,sans-serif;color:#c8d0e0;max-width:560px">
+        <h2 style="color:#00ff88;margin-bottom:4px">🛡 Bedrock IA — Alerta Semanal</h2>
+        <p style="color:#555;font-size:12px;margin-bottom:24px">{hoje.strftime('%d/%m/%Y')}</p>
+
+        <p>Esta semana o Bedrock IA monitorizou <strong style="color:#00ff88">{len(BANCO_DE_VIRUS)}</strong>
+        ameaças ativas. Mantém o teu dispositivo protegido!</p>
+
+        <h3 style="color:#ff3355;margin-top:24px">🦠 Vírus em Circulação</h3>
+        <ul style="padding-left:16px;line-height:2">{virus_lista}</ul>
+
+        <div style="margin-top:28px;padding:16px;background:#111318;border-radius:8px;border:1px solid #1e2430">
+            <p style="margin:0;font-size:13px">
+                💡 <strong>Dica da semana:</strong> Nunca abras anexos de e-mails desconhecidos.
+                Verifica sempre o hash MD5 de ficheiros suspeitos no painel do Bedrock IA.
+            </p>
+        </div>
+
+        <p style="margin-top:24px;font-size:11px;color:#444">
+            Recebeste este e-mail porque és assinante do Bedrock IA.<br>
+            Bedrock IA © 2026 — Proteção Ativa
+        </p>
+    </div>"""
+
+    hoje_data = datetime.date.today()
+    ativos = [e for e, c in DATABASE_ASSINANTES.items() if c["validade"] >= hoje_data]
+    for email in ativos:
+        enviar_email(email, f"🛡 Bedrock IA — Relatório Semanal {hoje.strftime('%d/%m')}", corpo)
+    print(f"[SEMANAL] Alertas enviados para {len(ativos)} assinantes.")
+
+
+def iniciar_agendador():
+    """Roda o agendador de emails numa thread separada."""
+    schedule.every().monday.at("09:00").do(enviar_alerta_semanal)
+    while True:
+        schedule.run_pending()
+        time.sleep(60)
+
+
+# =====================================================================
+if __name__ == '__main__':
+    # Inicia agendador de emails em background
+    t = threading.Thread(target=iniciar_agendador, daemon=True)
+    t.start()
+    app.run(port=5000, debug=True)
